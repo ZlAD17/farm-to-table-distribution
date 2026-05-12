@@ -18,6 +18,17 @@ builder.Services.AddSwaggerGen(c =>
     });
 });
 
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowGui", policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader();
+    });
+});
+
 // Register the DB helper as a singleton (it only holds the connection string)
 builder.Services.AddSingleton<DatabaseHelper>();
 
@@ -49,6 +60,9 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
+
+// استخدام CORS
+app.UseCors("AllowGui");
 
 app.UseMiddleware<GlobalExceptionMiddleware>();
 app.UseHttpsRedirection();
