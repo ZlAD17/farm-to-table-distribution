@@ -21,21 +21,44 @@ public class OrderRepository(DatabaseHelper db, HarvestBatchRepository batchRepo
             ORDER BY o.OrderedAt DESC;
             """;
 
-        await using var conn   = await db.OpenConnectionAsync();
-        await using var cmd    = new SqlCommand(sql, conn);
-        await using var reader = await cmd.ExecuteReaderAsync();
+        // Step 1: collect header rows — reader must be fully consumed and closed
+        // before we can issue the secondary batch-line query on the same connection.
+        var headers = new List<(int OrderId, int RestaurantId, string RestaurantName,
+            int? DriverId, string? DriverName, string Status,
+            DateTime OrderedAt, DateTime? DeliveredAt, string? Notes)>();
 
-        var orders = new List<(OrderResponse Header, int OrderId)>();
-        while (await reader.ReadAsync())
-            orders.Add((MapHeader(reader, []), reader.GetInt32(0)));
-
-        // Load batches per order
-        var result = new List<OrderResponse>();
-        foreach (var (header, orderId) in orders)
+        await using (var conn = await db.OpenConnectionAsync())
+        await using (var cmd  = new SqlCommand(sql, conn))
+        await using (var reader = await cmd.ExecuteReaderAsync())
         {
-            var batches = await GetBatchesForOrderAsync(conn, orderId);
-            var total   = batches.Sum(b => b.LineTotal);
-            result.Add(header with { Batches = batches, TotalAmount = total });
+            while (await reader.ReadAsync())
+            {
+                headers.Add((
+                    reader.GetInt32(0),
+                    reader.GetInt32(1),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetInt32(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4),
+                    reader.GetString(5),
+                    reader.GetDateTime(6),
+                    reader.IsDBNull(7) ? null : reader.GetDateTime(7),
+                    reader.IsDBNull(8) ? null : reader.GetString(8)
+                ));
+            }
+        } // reader and conn disposed here
+
+        // Step 2: load batches for each order (separate connection per order is fine
+        // because ADO.NET connection pooling makes this cheap).
+        var result = new List<OrderResponse>();
+        foreach (var h in headers)
+        {
+            var batches = await GetBatchesForOrderAsync(h.OrderId);
+            result.Add(new OrderResponse(
+                h.OrderId, h.RestaurantId, h.RestaurantName,
+                h.DriverId, h.DriverName, h.Status,
+                h.OrderedAt, h.DeliveredAt, h.Notes,
+                batches.Sum(b => b.LineTotal),
+                batches));
         }
         return result;
     }
@@ -52,16 +75,33 @@ public class OrderRepository(DatabaseHelper db, HarvestBatchRepository batchRepo
             WHERE o.OrderId = @OrderId;
             """;
 
-        await using var conn   = await db.OpenConnectionAsync();
-        await using var cmd    = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@OrderId", orderId);
-        await using var reader = await cmd.ExecuteReaderAsync();
+        // Read header into local variables, then close reader before secondary query.
+        int restId; string restName; int? driverId; string? driverName;
+        string status; DateTime orderedAt; DateTime? deliveredAt; string? notes;
+        bool found;
 
-        if (!await reader.ReadAsync()) return null;
+        await using (var conn   = await db.OpenConnectionAsync())
+        await using (var cmd    = new SqlCommand(sql, conn))
+        {
+            cmd.Parameters.AddWithValue("@OrderId", orderId);
+            await using var reader = await cmd.ExecuteReaderAsync();
+            found = await reader.ReadAsync();
+            if (!found) return null;
 
-        var batches = await GetBatchesForOrderAsync(conn, orderId);
-        var header  = MapHeader(reader, batches);
-        return header with { TotalAmount = batches.Sum(b => b.LineTotal) };
+            restId      = reader.GetInt32(1);
+            restName    = reader.GetString(2);
+            driverId    = reader.IsDBNull(3) ? null : reader.GetInt32(3);
+            driverName  = reader.IsDBNull(4) ? null : reader.GetString(4);
+            status      = reader.GetString(5);
+            orderedAt   = reader.GetDateTime(6);
+            deliveredAt = reader.IsDBNull(7) ? null : reader.GetDateTime(7);
+            notes       = reader.IsDBNull(8) ? null : reader.GetString(8);
+        } // reader and conn disposed here
+
+        var batches = await GetBatchesForOrderAsync(orderId);
+        return new OrderResponse(orderId, restId, restName, driverId, driverName,
+            status, orderedAt, deliveredAt, notes,
+            batches.Sum(b => b.LineTotal), batches);
     }
 
     // ── Create (transactional) ────────────────────────────────────────────────
@@ -143,8 +183,7 @@ public class OrderRepository(DatabaseHelper db, HarvestBatchRepository batchRepo
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static async Task<IReadOnlyList<OrderBatchResponse>> GetBatchesForOrderAsync(
-        SqlConnection conn, int orderId)
+    private async Task<IReadOnlyList<OrderBatchResponse>> GetBatchesForOrderAsync(int orderId)
     {
         const string sql = """
             SELECT ob.OrderBatchId, ob.BatchId,
@@ -158,7 +197,8 @@ public class OrderRepository(DatabaseHelper db, HarvestBatchRepository batchRepo
             WHERE ob.OrderId = @OrderId;
             """;
 
-        await using var cmd = new SqlCommand(sql, conn);
+        await using var conn   = await db.OpenConnectionAsync();
+        await using var cmd    = new SqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@OrderId", orderId);
         await using var reader = await cmd.ExecuteReaderAsync();
 
@@ -177,19 +217,4 @@ public class OrderRepository(DatabaseHelper db, HarvestBatchRepository batchRepo
         }
         return list;
     }
-
-    private static OrderResponse MapHeader(SqlDataReader r,
-        IReadOnlyList<OrderBatchResponse> batches) => new(
-        r.GetInt32(0),
-        r.GetInt32(1),
-        r.GetString(2),
-        r.IsDBNull(3) ? null : r.GetInt32(3),
-        r.IsDBNull(4) ? null : r.GetString(4),
-        r.GetString(5),
-        r.GetDateTime(6),
-        r.IsDBNull(7) ? null : r.GetDateTime(7),
-        r.IsDBNull(8) ? null : r.GetString(8),
-        0m,   // placeholder; will be replaced with actual sum after batches load
-        batches
-    );
 }
